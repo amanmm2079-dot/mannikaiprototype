@@ -1,0 +1,160 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function getUserRole() {
+      return getUserData().role;
+    }
+
+    function isVictim() {
+      return isAuthenticated() && (getUserRole() == 'victim');
+    }
+
+    function isCounsellor() {
+      return isAuthenticated() && (getUserRole() == 'counsellor');
+    }
+
+    function isDistrictOfficer() {
+      return isAuthenticated() && (getUserRole() == 'district_officer' || getUserRole() == 'caseworker');
+    }
+
+    function isStateAdmin() {
+      return isAuthenticated() && (getUserRole() == 'state_admin');
+    }
+
+    function isNationalAdmin() {
+      return isAuthenticated() && (getUserRole() == 'national_admin');
+    }
+
+    function isAuditor() {
+      return isAuthenticated() && (getUserRole() == 'auditor' || getUserRole() == 'sys_admin');
+    }
+
+    function isOwner(ownerUid) {
+      return isAuthenticated() && request.auth.uid == ownerUid;
+    }
+
+    function isAssignedCounsellor(caseData) {
+      return isCounsellor() && (caseData.assignedCounsellorUid == request.auth.uid);
+    }
+
+    function isInDistrict(caseData) {
+      return isDistrictOfficer() && (caseData.location.districtId == getUserData().districtId);
+    }
+
+    function isInState(caseData) {
+      return isStateAdmin() && (caseData.location.stateId == getUserData().stateId);
+    }
+
+    // --- USERS COLLECTION ---
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      
+      // Allow initial user creation
+      allow create: if isAuthenticated() && (
+        request.auth.uid == userId || isNationalAdmin()
+      );
+
+      // Prevent normal users from altering their role
+      allow update: if isAuthenticated() && (
+        isNationalAdmin() ||
+        (request.auth.uid == userId && request.resource.data.role == resource.data.role)
+      );
+
+      allow delete: if isNationalAdmin();
+    }
+
+    // --- CASES COLLECTION ---
+    match /cases/{caseId} {
+      // Read access enforced per role specifications
+      allow read: if isAuthenticated() && (
+        isNationalAdmin() ||
+        isAuditor() ||
+        isOwner(resource.data.ownerUid) ||
+        isAssignedCounsellor(resource.data) ||
+        isInDistrict(resource.data) ||
+        isInState(resource.data)
+      );
+
+      // Creation: Victims or officers
+      allow create: if isAuthenticated() && (
+        request.resource.data.ownerUid == request.auth.uid ||
+        isDistrictOfficer() ||
+        isNationalAdmin()
+      );
+
+      // Updates: Permitted per role
+      allow update: if isAuthenticated() && (
+        isNationalAdmin() ||
+        isAssignedCounsellor(resource.data) ||
+        isInDistrict(resource.data) ||
+        isInState(resource.data) ||
+        (isOwner(resource.data.ownerUid) && 
+         request.resource.data.assignedCounsellorUid == resource.data.assignedCounsellorUid)
+      );
+
+      allow delete: if isNationalAdmin();
+
+      // Events Subcollection (Immutable Timeline)
+      match /events/{eventId} {
+        allow read: if isAuthenticated() && (
+          isNationalAdmin() ||
+          isAuditor() ||
+          isOwner(get(/databases/$(database)/documents/cases/$(caseId)).data.ownerUid) ||
+          isAssignedCounsellor(get(/databases/$(database)/documents/cases/$(caseId)).data) ||
+          isInDistrict(get(/databases/$(database)/documents/cases/$(caseId)).data)
+        );
+
+        // Append-only timeline
+        allow create: if isAuthenticated();
+        allow update, delete: if false;
+      }
+
+      // Reviews Subcollection
+      match /reviews/{reviewId} {
+        allow read: if isAuthenticated() && (
+          isNationalAdmin() ||
+          isAuditor() ||
+          isAssignedCounsellor(get(/databases/$(database)/documents/cases/$(caseId)).data) ||
+          isInDistrict(get(/databases/$(database)/documents/cases/$(caseId)).data)
+        );
+
+        allow create, update: if isAuthenticated() && (
+          isCounsellor() || isDistrictOfficer() || isNationalAdmin()
+        );
+        allow delete: if isNationalAdmin();
+      }
+
+      // Interventions Subcollection
+      match /interventions/{interventionId} {
+        allow read: if isAuthenticated();
+        allow create, update: if isAuthenticated() && (
+          isDistrictOfficer() || isCounsellor() || isNationalAdmin()
+        );
+        allow delete: if isNationalAdmin();
+      }
+    }
+
+    // --- AUDIT LOGS COLLECTION (Strictly Append-Only) ---
+    match /auditLogs/{logId} {
+      allow read: if isAuditor() || isNationalAdmin() || isStateAdmin() || isDistrictOfficer();
+      allow create: if isAuthenticated() && request.resource.data.actorUid == request.auth.uid;
+      allow update, delete: if false; // Absolutely immutable
+    }
+
+    // --- SYSTEM CONFIG / THRESHOLDS ---
+    match /systemConfig/{configId} {
+      allow read: if isAuthenticated();
+      allow write: if isNationalAdmin();
+    }
+  }
+}
